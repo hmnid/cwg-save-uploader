@@ -1,0 +1,3 @@
+/dist/
+*.test.exe
+/coverage.out

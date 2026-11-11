@@ -27,15 +27,16 @@ type App struct {
 	SetStartup           func(bool) error
 }
 
-// Run coordinates folder events, upload results, and commands. Only this event
-// loop mutates poller/uploader state; network workers only return results.
+// Run owns coordination and presentation. Component events are handled
+// synchronously on this loop; network workers only send results through a channel.
 func (a *App) Run(ctx context.Context) {
 	state := newRunState(a)
 	ticker := time.NewTicker(time.Duration(a.Config.PollSeconds) * time.Second)
 	defer ticker.Stop()
-	defer state.uploader.workers.Wait()
+	defer state.uploader.wait()
 
-	state.publish("Starting; automatic uploads send saves to the public CWG2 leaderboard")
+	state.logger.Print("started")
+	state.refreshStatus()
 	state.tick(ctx, time.Now())
 	for {
 		select {
@@ -51,38 +52,32 @@ func (a *App) Run(ctx context.Context) {
 			state.dispatchUploads(ctx, time.Now())
 		case command := <-a.Commands:
 			if err := state.handleCommand(ctx, command); err != nil {
-				state.publish(err.Error())
+				state.reportCommandError(err)
 			}
 		}
 	}
 }
 
 func newRunState(a *App) *runState {
+	state := &runState{app: a, logger: componentLogger(a.Logger, "app")}
 	saveFolder, _ := storage.ExpandPath(a.Config.SaveFolder)
-	state := &runState{app: a}
 	state.resetPoller(saveFolder)
-	state.uploader = &snapshotUploader{
-		app:     a,
-		publish: state.publish,
-		results: make(chan uploadResult, 1),
-	}
+	state.uploader = newSnapshotUploader(a.Client, a.DryRun, componentLogger(a.Logger, "uploader"), state.handleUploadEvent)
 	return state
 }
 
 func (s *runState) resetPoller(saveFolder string) {
 	s.app.ForceUploadRequested = false
-	s.poller = newFolderPoller(saveFolder)
+	baseline := ""
 	lastUpload := s.app.LastUpload
 	if !s.app.DryRun && lastUpload.Destination == leaderboard.BaseURL && strings.EqualFold(lastUpload.SaveFolder, saveFolder) {
-		s.poller.lastEmittedFingerprint = lastUpload.Fingerprint
+		baseline = lastUpload.Fingerprint
 	}
+	s.poller = newFolderPoller(saveFolder, baseline, componentLogger(s.app.Logger, "poller"))
+	s.view.folder = pollEvent{}
 }
 
-// tick advances detection and retry scheduling independently. An unchanged or
-// temporarily unreadable folder must not prevent an already queued retry.
 func (s *runState) tick(ctx context.Context, now time.Time) {
-	// Keep the poller's request latched until a stable snapshot is emitted.
-	s.poller.forceNextEmission, s.app.ForceUploadRequested = s.poller.forceNextEmission || s.app.ForceUploadRequested, false
 	s.pollFolder(ctx, now)
 	s.dispatchUploads(ctx, now)
 }
@@ -91,20 +86,17 @@ func (s *runState) pollFolder(ctx context.Context, now time.Time) {
 	if ctx.Err() != nil {
 		return
 	}
-	emitted, err := s.poller.poll(ctx, now, s.app.Config.Automatic)
-	if err != nil {
-		if !s.uploader.busy {
-			s.publish(err.Error())
-		}
+	if s.app.ForceUploadRequested {
+		s.poller.requestEmission()
+		s.app.ForceUploadRequested = false
+	}
+	observation := s.poller.poll(ctx, now, s.app.Config.Automatic)
+	if observation.kind == pollCancelled {
 		return
 	}
-	if !emitted && !s.uploader.busy && s.uploader.pending == nil {
-		if s.app.Config.Automatic {
-			s.uploader.publishIdle()
-		} else {
-			s.publish("Automatic uploads off")
-		}
-	}
+	s.view.folder = observation
+	s.view.commandError = nil
+	s.refreshStatus()
 }
 
 func (s *runState) deliverReadyUpdate() {
@@ -115,22 +107,48 @@ func (s *runState) deliverReadyUpdate() {
 	}
 }
 
-// Accepted work runs independently of whether automatic polling is enabled.
+// Only ready messages affect dispatch; delivery is independent of polling state.
 func (s *runState) dispatchUploads(ctx context.Context, now time.Time) {
 	if ctx.Err() != nil {
 		return
 	}
-	// Deliver an already-ready snapshot before selecting pending data to upload.
-	// This is nonblocking: existing work never waits for a future emission.
 	s.deliverReadyUpdate()
-	if s.uploader.busy || s.uploader.pending != nil {
-		s.uploader.uploadPending(ctx, now)
+	s.uploader.uploadPending(ctx, now)
+}
+
+func (s *runState) handleUploadEvent(event uploadEvent) {
+	s.view.upload = event
+	s.view.commandError = nil
+	if event.kind == uploadIdle {
+		s.view.persistenceError = nil
+	}
+	if event.kind == uploadSucceeded {
+		s.recordUpload(event)
+	}
+	s.refreshStatus()
+}
+
+func (s *runState) recordUpload(event uploadEvent) {
+	lastUpload := storage.UploadState{
+		SaveFolder:  event.update.saveFolder,
+		Destination: leaderboard.BaseURL,
+		Fingerprint: event.update.snapshot.Fingerprint,
+		UploadedAt:  event.at,
+		Player:      event.result.Player,
+		Heroes:      event.result.Heroes,
+	}
+	s.app.LastUpload = lastUpload
+	s.view.persistenceError = storage.SaveUploadState(s.app.Dir, lastUpload)
+	if s.view.persistenceError != nil {
+		s.logger.Printf("save upload state failed: %v", s.view.persistenceError)
 	}
 }
 
 type runState struct {
 	app         *App
+	logger      *log.Logger
 	poller      *folderPoller
 	uploader    *snapshotUploader
+	view        statusView
 	lastMessage string
 }

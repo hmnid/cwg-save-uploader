@@ -38,12 +38,16 @@ func (s *runState) handleCommand(ctx context.Context, command Command) error {
 func (s *runState) toggleAutomatic() error {
 	config := s.app.Config
 	config.Automatic = !config.Automatic
-	return s.saveConfig(config)
+	if err := s.saveConfig(config); err != nil {
+		return err
+	}
+	s.logger.Printf("automatic uploads set to %t", config.Automatic)
+	return nil
 }
 
 func (s *runState) changeFolder(path string) error {
-	if s.uploader.busy {
-		return errors.New("Wait for the current upload before changing folders")
+	if err := s.uploader.canReset(); err != nil {
+		return fmt.Errorf("cannot change save folder: %w", err)
 	}
 	expanded, err := storage.ExpandPath(path)
 	if err != nil {
@@ -55,8 +59,12 @@ func (s *runState) changeFolder(path string) error {
 		return err
 	}
 	s.resetPoller(expanded)
-	s.uploader.pending = nil
-	s.uploader.clearRetry()
+	// The event loop owns all delivery transitions; reset remains permitted
+	// between the preflight check and the completed config write.
+	if err := s.uploader.reset(); err != nil {
+		return err
+	}
+	s.logger.Printf("save folder set to %q", expanded)
 	return nil
 }
 
@@ -74,6 +82,7 @@ func (s *runState) toggleStartup() error {
 		_ = s.app.SetStartup(previous)
 		return err
 	}
+	s.logger.Printf("launch at sign-in set to %t", config.LaunchAtLogin)
 	return nil
 }
 

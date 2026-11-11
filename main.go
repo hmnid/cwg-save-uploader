@@ -78,7 +78,7 @@ func run(console, dryRun bool) error {
 	}
 	if !dryRun {
 		if err := ui.SetStartup(config.LaunchAtLogin); err != nil {
-			logger.Printf("Startup registration: %v", err)
+			log.New(output, "[main] ", logger.Flags()).Printf("Startup registration: %v", err)
 		}
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)

@@ -118,7 +118,7 @@ Missing or inaccessible folders should produce a clear waiting/error status rath
 8. The folder poller emits a snapshot event when its fingerprint differs from the last emitted event, or when Upload now explicitly requests it. Record the emitted fingerprint only after handing the event to the channel.
 9. The coordinator forwards events to the uploader, which retains only the latest pending snapshot. Folder scanning continues during active uploads.
 10. The uploader trusts each emitted snapshot, handles retries/rejections independently of further folder events, and uploads the complete snapshot using one HTTP request. It performs no fingerprint deduplication of its own.
-11. On confirmed success, atomically persist only the submitted snapshot's fingerprint and update status.
+11. The uploader emits a typed success event. The coordinator updates upload history, atomically persists only the submitted snapshot's fingerprint, and refreshes rendered status.
 
 Polling is preferred for the first version: it is simple, handles replacement writes, and is fast enough for game saves. A filesystem watcher can be added later if measurements justify it.
 
@@ -143,7 +143,7 @@ Settling checks reduce incomplete reads but cannot guarantee that multiple files
 
 - Allow only one upload in flight.
 - Coalesce undelivered folder events and pending uploads to the latest stable snapshot rather than retaining a queue of historical snapshots. Events contain only save-folder identity and snapshot data.
-- Upload now sets runtime `App.ForceUploadRequested`. Each tick transfers and clears it with a latched OR into the poller's `forceNextEmission`, treating the next stable snapshot as new even if unchanged. Clear the latch only after emission; folder resets discard outstanding requests. The poller scans when automatic polling is enabled or a forced emission is pending. User-intent flags do not travel in events or results.
+- Upload now sets runtime `App.ForceUploadRequested`. Each tick's folder-polling step consumes it via `requestEmission()`, which preserves an already-latched `forceNextEmission`, treating the next stable snapshot as new even if unchanged. Clear the latch only after emission; folder resets discard outstanding requests. The poller scans when automatic polling is enabled or a forced emission is pending. User-intent flags do not travel in events or results.
 - Automatic uploads controls creation of new automatic work, not delivery. Turning it off stops automatic folder polling; already accepted snapshots, active requests, and retries continue. Upload now remains available without special delivery permissions. Quit cancels active network work and stops retries.
 - Retain pending data after transient failures and retry it even if no new folder event arrives. Prefer newer pending data over the failed snapshot when available.
 - Before dispatch, nonblockingly deliver an already-ready folder event so a due retry uses the newest available snapshot. If none is ready, dispatch existing work normally; do not wait for a future emission or consult the poller's force flag/channel length. Preserve Retry-After.
@@ -161,13 +161,16 @@ On restart, the coordinator seeds the poller from persisted successful history s
 
 Keep the implementation small, separating these responsibilities:
 
-- **Application coordinator:** startup baseline selection, lifecycle, routing folder events and upload results through channels, commands, status, and shutdown.
+- **Application coordinator:** startup baseline selection, lifecycle, routing snapshot events and worker results, consuming typed lifecycle events, successful-upload persistence, commands, status, and shutdown.
 - **Save scanner:** filename filtering, stability checks, snapshot reads, and fingerprinting.
 - **Folder poller:** scan scheduling and event deduplication against the last emitted snapshot; no knowledge of successful uploads or retries.
-- **Snapshot uploader:** pending-event coalescing, dispatch, retry/rejection policy, and successful-upload persistence.
+- **Snapshot uploader:** pending-event coalescing, dispatch, retry/rejection policy, typed lifecycle events, and encapsulated reset/wait operations. Receives narrow dependencies rather than the whole application; no persistence or presentation logic.
+- **Status renderer:** pure conversion of typed component observations into UI messages, with explicit status priority.
 - **Upload client:** request encoding, HTTP calls, response validation, and error classification.
 - **Local storage:** configuration and atomically persisted successful state.
 - **User interface:** tray controls, folder selection, and status presentation.
+
+Component observations and lifecycle events contain data, not UI text. Folder observations are returned to the coordinator; uploader transitions use an injected synchronous event sink on the owning loop. Snapshot and network-result channels remain the asynchronous handoff boundaries. Polling never queries uploader internals or suppresses scan errors during an upload. Operational logging stays within each component and is independent of rendering.
 
 Use Go's standard library for HTTP, JSON, hashing, logging, and polling. Select suitable Windows tray and folder-dialog dependencies during implementation.
 
@@ -205,7 +208,7 @@ Clone the default HTTP transport per client, preserve certificate verification, 
 
 Write `%LOCALAPPDATA%\CWG2Uploader\uploader.log`, capped at 2 MiB, retaining three previous files. Rotation is built into the application and requires no external tool or user maintenance.
 
-Log upload summaries and diagnostic errors, not outgoing save contents. Include a quoted preview of up to 512 response-body bytes in error messages, preserving valid UTF-8 characters and marking truncation. Escape newlines and control characters. Additionally log full HTTP error response bodies only when strictly smaller than 4 KiB; larger bodies appear only as bounded previews. Save files remain read-only to the application. The tray status is the primary visibility mechanism; logs are for troubleshooting. Keep successful uploads quiet and notify only for actionable, persistent problems.
+Use named loggers for the coordinator (`[app]`), poller (`[poller]`), and uploader (`[uploader]`), with `[main]` for startup integration. Log upload summaries and diagnostic errors, not outgoing save contents. Include a quoted preview of up to 512 response-body bytes in error messages, preserving valid UTF-8 characters and marking truncation. Escape newlines and control characters. Additionally log full HTTP error response bodies only when strictly smaller than 4 KiB; larger bodies appear only as bounded previews. Save files remain read-only to the application. The tray status is the primary visibility mechanism; logs are for troubleshooting. Keep successful uploads quiet and notify only for actionable, persistent problems.
 
 ## Security and Privacy
 

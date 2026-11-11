@@ -32,7 +32,7 @@ Application data lives in `%LOCALAPPDATA%\CWG2Uploader\`, not alongside the exec
 
 - `config.json`: human-editable settings.
 - `state.json`: the last successful snapshot fingerprint and upload summary.
-- `uploader.log`: automatically rotates at 2 MiB, keeping three previous files.
+- `uploader.log`: automatically rotates at 2 MiB, keeping three previous files. Entries identify their source with `[app]`, `[poller]`, `[uploader]`, or `[main]`.
 
 Example `config.json`:
 

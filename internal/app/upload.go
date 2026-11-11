@@ -3,21 +3,22 @@ package app
 import (
 	"context"
 	"errors"
-	"fmt"
+	"log"
 	"math/rand/v2"
 	"sync"
 	"time"
 
 	"cwg2uploader/internal/leaderboard"
 	"cwg2uploader/internal/saves"
-	"cwg2uploader/internal/storage"
 )
 
-// snapshotUploader owns delivery state independently of folder detection.
-// Its methods run on the coordinator's event loop; only Upload runs in a worker.
+// snapshotUploader owns delivery state. It reports typed events, without
+// depending on the coordinator, persistence, or presentation.
 type snapshotUploader struct {
-	app       *App
-	publish   func(string)
+	client    Uploader
+	dryRun    bool
+	logger    *log.Logger
+	emit      func(uploadEvent)
 	results   chan uploadResult
 	workers   sync.WaitGroup
 	pending   *folderUpdate
@@ -35,52 +36,40 @@ type rejection struct {
 func (u *snapshotUploader) queue(update folderUpdate) {
 	u.pending = &update
 	u.rejection = nil
+	u.logger.Printf("snapshot queued: %d eligible files", len(update.snapshot.Files))
+	if !u.busy {
+		u.emit(uploadEvent{kind: uploadQueued, update: update})
+	}
 }
 
 func (u *snapshotUploader) uploadPending(ctx context.Context, now time.Time) {
-	if ctx.Err() != nil {
-		return
-	}
-	if u.busy {
-		u.publish("Uploading saves")
-		return
-	}
-	if u.pending == nil {
-		if u.rejection != nil {
-			u.publishIdle()
-		}
+	if ctx.Err() != nil || u.busy || u.pending == nil {
 		return
 	}
 	update := *u.pending
 	if now.Before(u.retryAt) {
-		u.publish("Pending changes; retry at " + u.retryAt.Format("15:04:05"))
+		u.emit(uploadEvent{kind: uploadRetryScheduled, retryAt: u.retryAt})
 		return
 	}
-	if u.app.DryRun {
+	if u.dryRun {
 		u.pending = nil
-		u.publish(fmt.Sprintf("Dry run: %d eligible files; no upload or successful state written", len(update.snapshot.Files)))
+		u.logger.Printf("dry-run snapshot prepared: %d eligible files", len(update.snapshot.Files))
+		u.emit(uploadEvent{kind: uploadPreviewed, update: update})
 		return
 	}
 	u.pending = nil
 	u.startUpload(ctx, update)
 }
 
-func (u *snapshotUploader) publishIdle() {
-	if u.rejection != nil {
-		u.publish(u.rejection.message + "; -save ingame or choose Upload now")
-		return
-	}
-	u.publish("Up to date")
-}
-
 func (u *snapshotUploader) startUpload(ctx context.Context, update folderUpdate) {
 	u.rejection = nil
 	u.busy = true
-	u.publish("Uploading saves")
+	u.logger.Printf("upload started: %d eligible files", len(update.snapshot.Files))
+	u.emit(uploadEvent{kind: uploadStarted, update: update})
 	u.workers.Add(1)
 	go func() {
 		defer u.workers.Done()
-		result, err := u.app.Client.Upload(ctx, toUploadRequest(update.snapshot))
+		result, err := u.client.Upload(ctx, toUploadRequest(update.snapshot))
 		u.results <- uploadResult{update: update, result: result, err: err}
 	}()
 }
@@ -91,13 +80,20 @@ func (u *snapshotUploader) handleUploadResult(response uploadResult) {
 		u.handleUploadFailure(response)
 		return
 	}
-	u.recordUpload(response)
+	u.clearRetry()
+	u.logger.Printf("upload succeeded: %d heroes", response.result.Heroes)
+	u.emit(uploadEvent{kind: uploadSucceeded, update: response.update, result: response.result, at: time.Now()})
 }
 
 func (u *snapshotUploader) handleUploadFailure(response uploadResult) {
+	u.logger.Printf("upload failed: %v", response.err)
 	var uploadError *leaderboard.UploadError
-	if errors.As(response.err, &uploadError) && uploadError.Retry {
-		// Retry independently of new poller events, preferring any newer pending data.
+	retryable := errors.As(response.err, &uploadError) && uploadError.Retry
+	if uploadError != nil && uploadError.Body != "" {
+		u.logger.Printf("Upload error response body: %q", uploadError.Body)
+	}
+	if retryable {
+		// Prefer newer pending data, but retry even when no new event arrives.
 		if u.pending == nil {
 			u.queue(response.update)
 		}
@@ -107,41 +103,46 @@ func (u *snapshotUploader) handleUploadFailure(response uploadResult) {
 			delay = uploadError.After
 		}
 		u.retryAt = time.Now().Add(delay)
-	} else if u.pending == nil {
-		// Retain rejection status only while this failed snapshot is current.
-		// An event queued during the request already supersedes its result.
-		u.rejection = &rejection{
-			fingerprint: response.update.snapshot.Fingerprint,
-			message:     response.err.Error(),
-		}
+		u.logger.Printf("retry scheduled at %s", u.retryAt.Format(time.RFC3339))
+		u.emit(uploadEvent{kind: uploadRetryScheduled, err: response.err, retryAt: u.retryAt})
+		return
 	}
-	if uploadError != nil && uploadError.Body != "" {
-		u.app.Logger.Printf("Upload error response body: %q", uploadError.Body)
+	if u.pending != nil {
+		// The failed snapshot has already been superseded; retain only the log.
+		u.emit(uploadEvent{kind: uploadQueued, update: *u.pending})
+		return
 	}
-	u.publish(response.err.Error())
+	u.rejection = &rejection{fingerprint: response.update.snapshot.Fingerprint, message: response.err.Error()}
+	u.emit(uploadEvent{kind: uploadRejected, update: response.update, err: response.err})
 }
 
-func (u *snapshotUploader) recordUpload(response uploadResult) {
-	lastUpload := storage.UploadState{
-		SaveFolder:  response.update.saveFolder,
-		Destination: leaderboard.BaseURL,
-		Fingerprint: response.update.snapshot.Fingerprint,
-		UploadedAt:  time.Now(),
-		Player:      response.result.Player,
-		Heroes:      response.result.Heroes,
+func (u *snapshotUploader) canReset() error {
+	if u.busy {
+		return errors.New("cannot reset delivery while an upload is in progress")
 	}
-	u.app.LastUpload = lastUpload
+	return nil
+}
+
+func (u *snapshotUploader) reset() error {
+	if err := u.canReset(); err != nil {
+		return err
+	}
+	u.pending = nil
 	u.clearRetry()
-	if err := storage.SaveUploadState(u.app.Dir, lastUpload); err != nil {
-		u.publish("Uploaded, but could not persist successful state: " + err.Error())
-	} else {
-		u.publish(fmt.Sprintf("Uploaded %d heroes successfully", lastUpload.Heroes))
-	}
+	u.logger.Print("pending delivery state reset")
+	u.emit(uploadEvent{kind: uploadIdle})
+	return nil
 }
 
 func (u *snapshotUploader) clearRetry() {
 	u.rejection = nil
 	u.retryAt, u.attempt = time.Time{}, 0
+}
+
+func (u *snapshotUploader) wait() { u.workers.Wait() }
+
+func newSnapshotUploader(client Uploader, dryRun bool, logger *log.Logger, emit func(uploadEvent)) *snapshotUploader {
+	return &snapshotUploader{client: client, dryRun: dryRun, logger: logger, emit: emit, results: make(chan uploadResult, 1)}
 }
 
 func toUploadRequest(snapshot saves.Snapshot) leaderboard.UploadRequest {

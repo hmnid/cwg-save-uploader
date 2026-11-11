@@ -17,11 +17,18 @@ type Command struct {
 	Value string
 }
 
+func (s *runState) refreshStatus() {
+	s.publish(renderStatus(s.view))
+}
+
+func (s *runState) reportCommandError(err error) {
+	s.logger.Printf("command failed: %v", err)
+	s.view.commandError = err
+	s.refreshStatus()
+}
+
 func (s *runState) publish(message string) {
-	if message != s.lastMessage {
-		s.app.Logger.Print(message)
-		s.lastMessage = message
-	}
+	s.lastMessage = message
 	status := Status{Message: message, Config: s.app.Config, LastUpload: s.app.LastUpload.UploadedAt}
 	select {
 	case s.app.Updates <- status:

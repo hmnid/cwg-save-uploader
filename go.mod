@@ -4,7 +4,8 @@ go 1.24.0
 
 require (
 	github.com/getlantern/systray v1.2.2
-	golang.org/x/sys v0.30.0
+	golang.org/x/net v0.50.0
+	golang.org/x/sys v0.41.0
 )
 
 require (
@@ -16,4 +17,5 @@ require (
 	github.com/getlantern/ops v0.0.0-20190325191751-d70cb0d6f85f // indirect
 	github.com/go-stack/stack v1.8.0 // indirect
 	github.com/oxtoacart/bpool v0.0.0-20190530202638-03653db5a59c // indirect
+	golang.org/x/text v0.34.0 // indirect
 )

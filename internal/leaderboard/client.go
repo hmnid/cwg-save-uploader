@@ -9,15 +9,26 @@ import (
 	"net/http"
 	"strconv"
 	"time"
-
-	"cwg2uploader/internal/saves"
+	"unicode/utf8"
 )
 
 const BaseURL = "https://cwg2-leaderboard.rskiland.workers.dev"
+const responseSizeLimit = (1 << 20)
+const errorBodyLogLimit = 4 << 10
+const errorBodyExcerptLimit = 512
 
 type Client struct {
 	HTTP *http.Client
 	URL  string
+}
+
+type UploadFile struct {
+	Text  string `json:"text"`
+	Mtime int64  `json:"mtime"`
+}
+
+type UploadRequest struct {
+	Files map[string]UploadFile `json:"files"`
 }
 
 type Result struct {
@@ -29,6 +40,8 @@ type Result struct {
 }
 
 type UploadError struct {
+	// Body is retained for diagnostic logging only when smaller than 4 KiB.
+	Body    string
 	Message string
 	Retry   bool
 	After   time.Duration
@@ -36,8 +49,8 @@ type UploadError struct {
 
 func (e *UploadError) Error() string { return e.Message }
 
-func (c *Client) Upload(ctx context.Context, snapshot saves.Snapshot) (Result, error) {
-	body, err := json.Marshal(snapshot)
+func (c *Client) Upload(ctx context.Context, request UploadRequest) (Result, error) {
+	body, err := json.Marshal(request)
 	if err != nil {
 		return Result{}, err
 	}
@@ -52,26 +65,50 @@ func (c *Client) Upload(ctx context.Context, snapshot saves.Snapshot) (Result, e
 		return Result{}, &UploadError{Message: "upload connection failed: " + err.Error(), Retry: true}
 	}
 	defer response.Body.Close()
-	data, err := io.ReadAll(io.LimitReader(response.Body, (1<<20)+1))
+	data, err := io.ReadAll(io.LimitReader(response.Body, responseSizeLimit+1))
 	if err != nil {
 		return Result{}, &UploadError{Message: "read upload response: " + err.Error(), Retry: true}
 	}
-	if len(data) > 1<<20 {
-		return Result{}, &UploadError{Message: "server response exceeds safety limit"}
-	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		// Do not log arbitrary response text: it could contain save contents.
+		var errorBody string
+		if len(data) < errorBodyLogLimit {
+			errorBody = string(data)
+		}
 		return Result{}, &UploadError{
-			Message: fmt.Sprintf("upload rejected: HTTP %d", response.StatusCode),
+			Body:    errorBody,
+			Message: withResponseExcerpt(fmt.Sprintf("upload rejected: HTTP %d", response.StatusCode), data),
 			Retry:   response.StatusCode == 408 || response.StatusCode == 429 || response.StatusCode >= 500,
 			After:   retryAfter(response.Header.Get("Retry-After"), time.Now()),
 		}
 	}
+	if len(data) > responseSizeLimit {
+		return Result{}, &UploadError{Message: withResponseExcerpt("server response exceeds safety limit", data)}
+	}
 	var result Result
 	if err := json.Unmarshal(data, &result); err != nil || result.Player == "" || result.Heroes < 1 || len(result.UserHash) == 0 || string(result.UserHash) == "null" {
-		return Result{}, &UploadError{Message: "unrecognized upload response; success not recorded"}
+		return Result{}, &UploadError{Message: withResponseExcerpt("unrecognized upload response; success not recorded", data)}
 	}
 	return result, nil
+}
+
+func withResponseExcerpt(message string, data []byte) string {
+	if len(data) == 0 {
+		return message
+	}
+	end := 0
+	for end < len(data) && end < errorBodyExcerptLimit {
+		_, size := utf8.DecodeRune(data[end:])
+		if end+size > errorBodyExcerptLimit {
+			break
+		}
+		end += size
+	}
+	// Quoting escapes controls and invalid UTF-8 bytes without splitting valid runes.
+	message += ": " + strconv.Quote(string(data[:end]))
+	if end < len(data) {
+		message += " … [truncated]"
+	}
+	return message
 }
 
 func retryAfter(value string, now time.Time) time.Duration {

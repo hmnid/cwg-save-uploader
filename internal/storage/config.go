@@ -15,6 +15,7 @@ type Config struct {
 	PollSeconds   int    `json:"poll_interval_seconds"`
 	Automatic     bool   `json:"upload_automatically"`
 	LaunchAtLogin bool   `json:"launch_at_login"`
+	ProxyURL      string `json:"proxy_url"`
 }
 
 func LoadConfig(dir, defaultFolder string) (Config, bool, error) {

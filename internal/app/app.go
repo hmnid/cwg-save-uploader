@@ -2,220 +2,135 @@ package app
 
 import (
 	"context"
-	"errors"
-	"fmt"
 	"log"
-	"math/rand/v2"
 	"strings"
-	"sync"
 	"time"
 
 	"cwg2uploader/internal/leaderboard"
-	"cwg2uploader/internal/saves"
 	"cwg2uploader/internal/storage"
 )
 
 type Uploader interface {
-	Upload(context.Context, saves.Snapshot) (leaderboard.Result, error)
+	Upload(context.Context, leaderboard.UploadRequest) (leaderboard.Result, error)
 }
 
 type App struct {
-	Dir        string
-	Config     storage.Config
-	State      storage.State
-	Client     Uploader
-	Logger     *log.Logger
-	DryRun     bool
-	Commands   chan Command
-	Updates    chan Status
-	SetStartup func(bool) error
+	Dir                  string
+	Config               storage.Config
+	LastUpload           storage.UploadState
+	Client               Uploader
+	Logger               *log.Logger
+	DryRun               bool
+	ForceUploadRequested bool
+	Commands             chan Command
+	Updates              chan Status
+	SetStartup           func(bool) error
 }
 
-// Run owns mutable application state. Upload workers only return results.
+// Run coordinates folder events, upload results, and commands. Only this event
+// loop mutates poller/uploader state; network workers only return results.
 func (a *App) Run(ctx context.Context) {
-	folder, _ := storage.ExpandPath(a.Config.SaveFolder)
-	scanner := &saves.Scanner{Folder: folder, Quiet: 5 * time.Second}
+	state := newRunState(a)
 	ticker := time.NewTicker(time.Duration(a.Config.PollSeconds) * time.Second)
 	defer ticker.Stop()
-	results := make(chan uploadResult, 1)
-	var workers sync.WaitGroup
-	defer workers.Wait()
-	var busy bool
-	var blocked string
-	var blockedMessage string
-	var retryAt time.Time
-	attempt := 0
-	manual := false
-	lastMessage := ""
-	publish := func(message string) {
-		if message != lastMessage {
-			a.Logger.Print(message)
-			lastMessage = message
-		}
-		status := Status{Message: message, Config: a.Config, LastUpload: a.State.UploadedAt}
-		select {
-		case a.Updates <- status:
-		default:
-			select {
-			case <-a.Updates:
-			default:
-			}
-			select {
-			case a.Updates <- status:
-			default:
-			}
-		}
-	}
-	poll := func(now time.Time) {
-		if ctx.Err() != nil {
-			return
-		}
-		if busy {
-			publish("Uploading saves")
-			return
-		}
-		if !a.Config.Automatic && !manual {
-			publish("Paused")
-			return
-		}
-		snapshot, err := scanner.Scan(now)
-		if err != nil {
-			publish(err.Error())
-			return
-		}
-		if a.State.Destination == leaderboard.BaseURL && strings.EqualFold(a.State.Folder, folder) && a.State.Fingerprint == snapshot.Fingerprint && !manual && !a.DryRun {
-			publish("Up to date")
-			return
-		}
-		if blocked == snapshot.Fingerprint && !manual {
-			publish(blockedMessage + "; change saves or choose Upload now")
-			return
-		}
-		if now.Before(retryAt) {
-			publish("Pending changes; retry at " + retryAt.Format("15:04:05"))
-			return
-		}
-		if a.DryRun {
-			publish(fmt.Sprintf("Dry run: %d eligible files; no upload or successful state written", len(snapshot.Files)))
-			manual = false
-			return
-		}
-		busy = true
-		publish("Uploading saves")
-		workers.Add(1)
-		uploadFolder := folder
-		go func() {
-			defer workers.Done()
-			result, err := a.Client.Upload(ctx, snapshot)
-			results <- uploadResult{snapshot: snapshot, folder: uploadFolder, result: result, err: err}
-		}()
-	}
-	publish("Starting; automatic uploads send saves to the public CWG2 leaderboard")
-	poll(time.Now())
+	defer state.uploader.workers.Wait()
+
+	state.publish("Starting; automatic uploads send saves to the public CWG2 leaderboard")
+	state.tick(ctx, time.Now())
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case now := <-ticker.C:
-			poll(now)
-		case response := <-results:
-			busy = false
-			if response.err != nil {
-				var uploadError *leaderboard.UploadError
-				if errors.As(response.err, &uploadError) && uploadError.Retry {
-					delay := backoff(attempt)
-					attempt++
-					if uploadError.After > delay {
-						delay = uploadError.After
-					}
-					retryAt = time.Now().Add(delay)
-				} else {
-					blocked = response.snapshot.Fingerprint
-					blockedMessage = response.err.Error()
-					manual = false
-				}
-				publish(response.err.Error())
-				continue
-			}
-			state := storage.State{Folder: response.folder, Destination: leaderboard.BaseURL, Fingerprint: response.snapshot.Fingerprint, UploadedAt: time.Now(), Player: response.result.Player, Heroes: response.result.Heroes}
-			a.State = state
-			manual = false
-			blocked, retryAt, attempt = "", time.Time{}, 0
-			if err := storage.SaveState(a.Dir, state); err != nil {
-				publish("Uploaded, but could not persist successful state: " + err.Error())
-			} else {
-				publish(fmt.Sprintf("Uploaded %d heroes successfully", state.Heroes))
-			}
+			state.tick(ctx, now)
+		case update := <-state.poller.updates:
+			state.uploader.queue(update)
+			state.dispatchUploads(ctx, time.Now())
+		case response := <-state.uploader.results:
+			state.uploader.handleUploadResult(response)
+			state.dispatchUploads(ctx, time.Now())
 		case command := <-a.Commands:
-			switch command.Kind {
-			case "upload":
-				manual, blocked = true, ""
-				// Manual retry does not bypass Retry-After or stability checks.
-			case "pause":
-				config := a.Config
-				config.Automatic = !config.Automatic
-				if err := storage.SaveConfig(a.Dir, config); err != nil {
-					publish("Save config: " + err.Error())
-					continue
-				}
-				a.Config = config
-			case "folder":
-				if busy {
-					publish("Wait for the current upload before changing folders")
-					continue
-				}
-				expanded, err := storage.ExpandPath(command.Value)
-				if err != nil {
-					publish(err.Error())
-					continue
-				}
-				config := a.Config
-				config.SaveFolder = expanded
-				if err := storage.SaveConfig(a.Dir, config); err != nil {
-					publish("Save config: " + err.Error())
-					continue
-				}
-				a.Config, folder = config, expanded
-				scanner = &saves.Scanner{Folder: folder, Quiet: 5 * time.Second}
-				blocked, retryAt, attempt = "", time.Time{}, 0
-			case "startup":
-				enabled := !a.Config.LaunchAtLogin
-				if a.SetStartup == nil {
-					publish("Startup integration unavailable")
-					continue
-				}
-				if err := a.SetStartup(enabled); err != nil {
-					publish("Startup registration: " + err.Error())
-					continue
-				}
-				config := a.Config
-				config.LaunchAtLogin = enabled
-				if err := storage.SaveConfig(a.Dir, config); err != nil {
-					_ = a.SetStartup(a.Config.LaunchAtLogin)
-					publish("Save config: " + err.Error())
-					continue
-				}
-				a.Config = config
+			if err := state.handleCommand(ctx, command); err != nil {
+				state.publish(err.Error())
 			}
-			poll(time.Now())
 		}
 	}
 }
 
-type uploadResult struct {
-	snapshot saves.Snapshot
-	folder   string
-	result   leaderboard.Result
-	err      error
+func newRunState(a *App) *runState {
+	saveFolder, _ := storage.ExpandPath(a.Config.SaveFolder)
+	state := &runState{app: a}
+	state.resetPoller(saveFolder)
+	state.uploader = &snapshotUploader{
+		app:     a,
+		publish: state.publish,
+		results: make(chan uploadResult, 1),
+	}
+	return state
 }
 
-func backoff(attempt int) time.Duration {
-	if attempt > 6 {
-		attempt = 6
+func (s *runState) resetPoller(saveFolder string) {
+	s.app.ForceUploadRequested = false
+	s.poller = newFolderPoller(saveFolder)
+	lastUpload := s.app.LastUpload
+	if !s.app.DryRun && lastUpload.Destination == leaderboard.BaseURL && strings.EqualFold(lastUpload.SaveFolder, saveFolder) {
+		s.poller.lastEmittedFingerprint = lastUpload.Fingerprint
 	}
-	delay := 5 * time.Second * time.Duration(1<<attempt)
-	if delay > 5*time.Minute {
-		delay = 5 * time.Minute
+}
+
+// tick advances detection and retry scheduling independently. An unchanged or
+// temporarily unreadable folder must not prevent an already queued retry.
+func (s *runState) tick(ctx context.Context, now time.Time) {
+	// Keep the poller's request latched until a stable snapshot is emitted.
+	s.poller.forceNextEmission, s.app.ForceUploadRequested = s.poller.forceNextEmission || s.app.ForceUploadRequested, false
+	s.pollFolder(ctx, now)
+	s.dispatchUploads(ctx, now)
+}
+
+func (s *runState) pollFolder(ctx context.Context, now time.Time) {
+	if ctx.Err() != nil {
+		return
 	}
-	return delay/2 + time.Duration(rand.Int64N(int64(delay/2)+1))
+	emitted, err := s.poller.poll(ctx, now, s.app.Config.Automatic)
+	if err != nil {
+		if !s.uploader.busy {
+			s.publish(err.Error())
+		}
+		return
+	}
+	if !emitted && !s.uploader.busy && s.uploader.pending == nil {
+		if s.app.Config.Automatic {
+			s.uploader.publishIdle()
+		} else {
+			s.publish("Automatic uploads off")
+		}
+	}
+}
+
+func (s *runState) deliverReadyUpdate() {
+	select {
+	case update := <-s.poller.updates:
+		s.uploader.queue(update)
+	default:
+	}
+}
+
+// Accepted work runs independently of whether automatic polling is enabled.
+func (s *runState) dispatchUploads(ctx context.Context, now time.Time) {
+	if ctx.Err() != nil {
+		return
+	}
+	// Deliver an already-ready snapshot before selecting pending data to upload.
+	// This is nonblocking: existing work never waits for a future emission.
+	s.deliverReadyUpdate()
+	if s.uploader.busy || s.uploader.pending != nil {
+		s.uploader.uploadPending(ctx, now)
+	}
+}
+
+type runState struct {
+	app         *App
+	poller      *folderPoller
+	uploader    *snapshotUploader
+	lastMessage string
 }

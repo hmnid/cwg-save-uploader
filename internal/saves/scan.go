@@ -26,13 +26,13 @@ type Scanner struct {
 }
 
 type File struct {
-	Text  string `json:"text"`
-	Mtime int64  `json:"mtime"`
+	Text  string
+	Mtime int64
 }
 
 type Snapshot struct {
-	Files       map[string]File `json:"files"`
-	Fingerprint string          `json:"-"`
+	Files       map[string]File
+	Fingerprint string
 }
 
 // Scan waits for stable metadata, then verifies it again after reading the snapshot.

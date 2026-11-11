@@ -17,14 +17,14 @@ func TestLoadConfigCreatesDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !firstRun || !config.Automatic || config.LaunchAtLogin || config.PollSeconds != 5 || config.SaveFolder != folder {
+	if !firstRun || !config.Automatic || config.LaunchAtLogin || config.PollSeconds != 5 || config.SaveFolder != folder || config.ProxyURL != "" {
 		t.Fatalf("unexpected defaults: %+v", config)
 	}
 }
 
 func TestConfigPersistsUserSettings(t *testing.T) {
 	dir := t.TempDir()
-	want := Config{SaveFolder: t.TempDir(), PollSeconds: 10, Automatic: false, LaunchAtLogin: true}
+	want := Config{SaveFolder: t.TempDir(), PollSeconds: 10, Automatic: false, LaunchAtLogin: true, ProxyURL: "socks5://127.0.0.1:1080"}
 
 	saveErr := SaveConfig(dir, want)
 	got, firstRun, loadErr := LoadConfig(dir, "unused")
@@ -64,20 +64,39 @@ func TestExpandPathExpandsWindowsVariables(t *testing.T) {
 	}
 }
 
-func TestStateAtomicallyReplacesPreviousState(t *testing.T) {
+func TestUploadStateAtomicallyReplacesPreviousState(t *testing.T) {
 	dir := t.TempDir()
-	first := State{Fingerprint: "old"}
-	want := State{Folder: "folder", Destination: "server", Fingerprint: "new", UploadedAt: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC), Player: "Player", Heroes: 2}
+	first := UploadState{Fingerprint: "old"}
+	want := UploadState{SaveFolder: "folder", Destination: "server", Fingerprint: "new", UploadedAt: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC), Player: "Player", Heroes: 2}
 
-	firstErr := SaveState(dir, first)
-	secondErr := SaveState(dir, want)
-	got, loadErr := LoadState(dir)
+	firstErr := SaveUploadState(dir, first)
+	secondErr := SaveUploadState(dir, want)
+	got, loadErr := LoadUploadState(dir)
 
 	if firstErr != nil || secondErr != nil || loadErr != nil {
 		t.Fatalf("errors: %v, %v, %v", firstErr, secondErr, loadErr)
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %+v; want %+v", got, want)
+	}
+}
+
+func TestLoadUploadStateReadsSaveFolder(t *testing.T) {
+	dir := t.TempDir()
+	data := []byte(`{"save_folder":"saves","destination":"server","fingerprint":"existing","uploaded_at":"2025-01-01T00:00:00Z","player":"Player","heroes":2}`)
+	if err := os.WriteFile(filepath.Join(dir, "state.json"), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	want := UploadState{SaveFolder: "saves", Destination: "server", Fingerprint: "existing", UploadedAt: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC), Player: "Player", Heroes: 2}
+
+	state, err := LoadUploadState(dir)
+
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(state, want) {
+		t.Fatalf("got %+v; want %+v", state, want)
 	}
 }
 

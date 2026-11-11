@@ -8,8 +8,8 @@ import (
 	"time"
 )
 
-type State struct {
-	Folder      string    `json:"folder"`
+type UploadState struct {
+	SaveFolder  string    `json:"save_folder"`
 	Destination string    `json:"destination"`
 	Fingerprint string    `json:"fingerprint"`
 	UploadedAt  time.Time `json:"uploaded_at"`
@@ -17,8 +17,8 @@ type State struct {
 	Heroes      int       `json:"heroes"`
 }
 
-func LoadState(dir string) (State, error) {
-	var state State
+func LoadUploadState(dir string) (UploadState, error) {
+	var state UploadState
 	data, err := os.ReadFile(filepath.Join(dir, "state.json"))
 	if errors.Is(err, os.ErrNotExist) {
 		return state, nil
@@ -30,6 +30,6 @@ func LoadState(dir string) (State, error) {
 	return state, err
 }
 
-func SaveState(dir string, state State) error {
+func SaveUploadState(dir string, state UploadState) error {
 	return atomicJSON(filepath.Join(dir, "state.json"), state)
 }

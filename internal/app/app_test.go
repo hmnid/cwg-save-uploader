@@ -1,12 +1,14 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
 	"log"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -19,6 +21,7 @@ import (
 func TestAppPersistsSuccessfulSnapshot(t *testing.T) {
 	t.Parallel()
 	application, client := fixtureApp(t)
+	snapshot := readSnapshot(t, application.Config.SaveFolder)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
@@ -28,12 +31,12 @@ func TestAppPersistsSuccessfulSnapshot(t *testing.T) {
 	status := awaitStatus(t, ctx, application, "successfully")
 	cancel()
 	<-done
-	state, err := storage.LoadState(application.Dir)
+	state, err := storage.LoadUploadState(application.Dir)
 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if state.Fingerprint != request.snapshot.Fingerprint || state.Heroes != 1 || state.Player != "Player" {
+	if state.Fingerprint != snapshot.Fingerprint || state.Heroes != 1 || state.Player != "Player" {
 		t.Fatalf("incorrect persisted state: %+v", state)
 	}
 	if status.LastUpload.IsZero() {
@@ -50,7 +53,7 @@ func TestAppSkipsSnapshotAlreadyUploadedBeforeRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	application.State = storage.State{Folder: application.Config.SaveFolder, Destination: leaderboard.BaseURL, Fingerprint: snapshot.Fingerprint}
+	application.LastUpload = storage.UploadState{SaveFolder: application.Config.SaveFolder, Destination: leaderboard.BaseURL, Fingerprint: snapshot.Fingerprint}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
@@ -67,6 +70,37 @@ func TestAppSkipsSnapshotAlreadyUploadedBeforeRestart(t *testing.T) {
 	}
 }
 
+func TestAppExplicitUploadRetriesWithAutomaticUploadsOff(t *testing.T) {
+	t.Parallel()
+	application, client := fixtureApp(t)
+	snapshot := readSnapshot(t, application.Config.SaveFolder)
+	application.Config.Automatic = false
+	application.LastUpload = storage.UploadState{SaveFolder: application.Config.SaveFolder, Destination: leaderboard.BaseURL, Fingerprint: snapshot.Fingerprint}
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+
+	done := startApp(ctx, application)
+	_ = awaitStatus(t, ctx, application, "Automatic uploads off")
+	application.Commands <- Command{Kind: "upload"}
+	first := nextRequest(t, ctx, client)
+	first.reply <- uploadReply{err: &leaderboard.UploadError{Message: "temporary failure", Retry: true}}
+	second := nextRequest(t, ctx, client)
+	second.reply <- uploadReply{result: successfulResult()}
+	_ = awaitStatus(t, ctx, application, "successfully")
+	cancel()
+	<-done
+
+	if application.Config.Automatic {
+		t.Fatal("one-off upload enabled automatic uploads")
+	}
+	if application.LastUpload.UploadedAt.IsZero() || application.LastUpload.Fingerprint != snapshot.Fingerprint {
+		t.Fatal("forced emission or its retry did not complete")
+	}
+	if !reflect.DeepEqual(first.payload, second.payload) {
+		t.Fatal("retry changed the forced snapshot")
+	}
+}
+
 func TestAppDoesNotPersistRejectedSnapshot(t *testing.T) {
 	t.Parallel()
 	application, client := fixtureApp(t)
@@ -79,13 +113,36 @@ func TestAppDoesNotPersistRejectedSnapshot(t *testing.T) {
 	_ = awaitStatus(t, ctx, application, "HTTP 400")
 	cancel()
 	<-done
-	state, err := storage.LoadState(application.Dir)
+	state, err := storage.LoadUploadState(application.Dir)
 
 	if err != nil {
 		t.Fatal(err)
 	}
 	if state.Fingerprint != "" {
 		t.Fatal("rejected snapshot recorded as successful")
+	}
+}
+
+func TestAppLogsQuotedErrorResponseBody(t *testing.T) {
+	t.Parallel()
+	application, client := fixtureApp(t)
+	var logs bytes.Buffer
+	application.Logger = log.New(&logs, "", 0)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	done := startApp(ctx, application)
+	request := nextRequest(t, ctx, client)
+	request.reply <- uploadReply{err: &leaderboard.UploadError{Message: "HTTP 408", Body: "timeout\ntry again\x1b"}}
+	status := awaitStatus(t, ctx, application, "HTTP 408")
+	cancel()
+	<-done
+
+	if !strings.Contains(logs.String(), `Upload error response body: "timeout\ntry again\x1b"`) {
+		t.Fatalf("quoted response body missing from logs: %s", logs.String())
+	}
+	if strings.Contains(status.Message, "try again") {
+		t.Fatal("response body should be logged, not included in tray status")
 	}
 }
 
@@ -100,7 +157,7 @@ func TestAppDryRunDoesNotUploadOrPersistState(t *testing.T) {
 	_ = awaitStatus(t, ctx, application, "Dry run:")
 	cancel()
 	<-done
-	state, err := storage.LoadState(application.Dir)
+	state, err := storage.LoadUploadState(application.Dir)
 
 	if err != nil {
 		t.Fatal(err)
@@ -120,7 +177,7 @@ func TestAppCancelsInFlightUploadOnShutdown(t *testing.T) {
 	_ = nextRequest(t, ctx, client)
 	cancel()
 	<-done
-	state, err := storage.LoadState(application.Dir)
+	state, err := storage.LoadUploadState(application.Dir)
 
 	if err != nil {
 		t.Fatal(err)
@@ -133,6 +190,7 @@ func TestAppCancelsInFlightUploadOnShutdown(t *testing.T) {
 func TestAppRetriesTransientFailure(t *testing.T) {
 	t.Parallel()
 	application, client := fixtureApp(t)
+	snapshot := readSnapshot(t, application.Config.SaveFolder)
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
 
@@ -144,15 +202,15 @@ func TestAppRetriesTransientFailure(t *testing.T) {
 	_ = awaitStatus(t, ctx, application, "successfully")
 	cancel()
 	<-done
-	state, err := storage.LoadState(application.Dir)
+	state, err := storage.LoadUploadState(application.Dir)
 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if state.Fingerprint != second.snapshot.Fingerprint {
+	if state.Fingerprint != snapshot.Fingerprint {
 		t.Fatal("retry success was not persisted")
 	}
-	if first.snapshot.Fingerprint != second.snapshot.Fingerprint {
+	if !reflect.DeepEqual(first.payload, second.payload) {
 		t.Fatal("retry unexpectedly changed the snapshot")
 	}
 }
@@ -177,8 +235,28 @@ func TestAppDetectsChangesMadeDuringUpload(t *testing.T) {
 	if writeErr != nil {
 		t.Fatal(writeErr)
 	}
-	if first.snapshot.Fingerprint == second.snapshot.Fingerprint {
-		t.Fatal("changed save did not produce another snapshot")
+	if first.payload.Files["HERO_01_123.pld"].Text != "save" || second.payload.Files["HERO_01_123.pld"].Text != "new save contents" {
+		t.Fatal("changed save was not included in the next upload request")
+	}
+}
+
+func TestToUploadRequestConvertsSnapshotFiles(t *testing.T) {
+	snapshot := saves.Snapshot{
+		Files: map[string]saves.File{
+			"HERO_01_123.pld":        {Text: "hero", Mtime: 1700000000123},
+			"ACCOUNT_player_123.pld": {Text: "account", Mtime: 1700000000456},
+		},
+		Fingerprint: "local-only",
+	}
+	want := leaderboard.UploadRequest{Files: map[string]leaderboard.UploadFile{
+		"HERO_01_123.pld":        {Text: "hero", Mtime: 1700000000123},
+		"ACCOUNT_player_123.pld": {Text: "account", Mtime: 1700000000456},
+	}}
+
+	request := toUploadRequest(snapshot)
+
+	if !reflect.DeepEqual(request, want) {
+		t.Fatalf("request = %+v; want %+v", request, want)
 	}
 }
 
@@ -187,13 +265,13 @@ type uploadReply struct {
 	err    error
 }
 type uploadRequest struct {
-	snapshot saves.Snapshot
-	reply    chan uploadReply
+	payload leaderboard.UploadRequest
+	reply   chan uploadReply
 }
 type fakeUploader struct{ requests chan uploadRequest }
 
-func (f *fakeUploader) Upload(ctx context.Context, snapshot saves.Snapshot) (leaderboard.Result, error) {
-	request := uploadRequest{snapshot: snapshot, reply: make(chan uploadReply, 1)}
+func (f *fakeUploader) Upload(ctx context.Context, payload leaderboard.UploadRequest) (leaderboard.Result, error) {
+	request := uploadRequest{payload: payload, reply: make(chan uploadReply, 1)}
 	select {
 	case f.requests <- request:
 	case <-ctx.Done():
@@ -217,6 +295,17 @@ func fixtureApp(t *testing.T) (*App, *fakeUploader) {
 	}
 	client := &fakeUploader{requests: make(chan uploadRequest, 8)}
 	return &App{Dir: t.TempDir(), Config: storage.Config{SaveFolder: folder, PollSeconds: 1, Automatic: true}, Client: client, Logger: log.New(io.Discard, "", 0), Commands: make(chan Command, 8), Updates: make(chan Status, 1)}, client
+}
+
+func readSnapshot(t *testing.T, folder string) saves.Snapshot {
+	t.Helper()
+	scanner := saves.Scanner{Folder: folder}
+	_, _ = scanner.Scan(time.Now())
+	snapshot, err := scanner.Scan(time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return snapshot
 }
 
 func startApp(ctx context.Context, application *App) <-chan struct{} {

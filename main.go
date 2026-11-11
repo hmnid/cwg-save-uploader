@@ -8,11 +8,9 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net/http"
 	"os"
 	"os/signal"
 	"strings"
-	"time"
 
 	"cwg2uploader/internal/app"
 	"cwg2uploader/internal/leaderboard"
@@ -52,6 +50,11 @@ func run(console, dryRun bool) error {
 	if err != nil {
 		return err
 	}
+	httpClient, err := leaderboard.NewHTTPClient(config.ProxyURL)
+	if err != nil {
+		return err
+	}
+	defer httpClient.CloseIdleConnections()
 	writer, err := storage.OpenLog(dir)
 	if err != nil {
 		return err
@@ -66,12 +69,12 @@ func run(console, dryRun bool) error {
 		// Inspect even if automatic uploads are paused; do not persist this override.
 		config.Automatic = true
 	}
-	state, err := storage.LoadState(dir)
+	lastUpload, err := storage.LoadUploadState(dir)
 	if err != nil {
 		return fmt.Errorf("load state.json (fix or remove it before restarting): %w", err)
 	}
 	if firstRun && !console {
-		ui.Message("CWG2 Uploader", "This app automatically sends your CWG2 saves to the third-party public leaderboard. Existing saves will upload on startup. It never modifies game saves.\n\nUse the tray menu to pause uploads or choose a different save folder.\n\nConfiguration and rotating logs: "+dir)
+		ui.Message("CWG2 Uploader", "This app automatically sends your CWG2 saves to the third-party public leaderboard. Existing saves will upload on startup. It never modifies game saves.\n\nUse the tray menu to turn off automatic uploads or choose a different save folder. Already queued uploads and retries will continue.\n\nConfiguration and rotating logs: "+dir)
 	}
 	if !dryRun {
 		if err := ui.SetStartup(config.LaunchAtLogin); err != nil {
@@ -81,11 +84,8 @@ func run(console, dryRun bool) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 	application := &app.App{
-		Dir: dir, Config: config, State: state, DryRun: dryRun,
-		Client: &leaderboard.Client{URL: leaderboard.BaseURL, HTTP: &http.Client{
-			Timeout:       30 * time.Second,
-			CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse },
-		}},
+		Dir: dir, Config: config, LastUpload: lastUpload, DryRun: dryRun,
+		Client: &leaderboard.Client{URL: leaderboard.BaseURL, HTTP: httpClient},
 		Logger: logger, Commands: make(chan app.Command, 16), Updates: make(chan app.Status, 1), SetStartup: ui.SetStartup,
 	}
 	done := make(chan struct{})

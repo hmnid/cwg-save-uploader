@@ -17,12 +17,12 @@ The app polls every five seconds and waits at least five seconds of observed sta
 
 - **Status:** click the top item for the full message and save folder.
 - **Last upload:** last confirmed successful submission.
-- **Automatic uploads:** uncheck to pause; an already-running request may still finish.
-- **Upload now:** request one upload even when paused. Stability checks and server retry delays still apply.
+- **Automatic uploads:** uncheck to stop sending new saves automatically. Already queued uploads and retries continue until they finish.
+- **Upload now:** send the current saves even with Automatic uploads off. Stability checks and server retry delays still apply.
 - **Choose save folder...:** change the watched folder when no upload is in flight.
 - **Launch at Windows sign-in:** register or remove a current-user startup entry. No administrator rights needed. Moving the executable requires updating the entry; restart the app at its new location to do so.
 - **Open leaderboard**, **Open logs**, and **Open config.json**.
-- **Quit:** cancel pending network work and exit.
+- **Quit:** cancel active network work, stop retries, and exit.
 
 Successes stay quiet. Check the tray status for errors; bounded logs provide diagnostics. Only one instance can run per Windows session.
 
@@ -41,13 +41,30 @@ Example `config.json`:
   "save_folder": "%USERPROFILE%\\Documents\\Warcraft III\\CustomMapData\\CWG2",
   "poll_interval_seconds": 5,
   "upload_automatically": true,
-  "launch_at_login": false
+  "launch_at_login": false,
+  "proxy_url": ""
 }
 ```
 
 Initial discovery honors redirected Documents folders, including OneDrive. Configured `%VARIABLE%` references are expanded at runtime. Restart after manual configuration edits; tray changes are persisted immediately. To disable automatic uploading before a first real launch, create this configuration with `upload_automatically` set to `false`.
 
-Do not delete `state.json` unless you want existing saves submitted again. A corrupted configuration or state file produces an error rather than silently resetting preferences or upload history. Raw save contents are never logged.
+Do not delete `state.json` unless you want existing saves submitted again. A corrupted configuration or state file produces an error rather than silently resetting preferences or upload history. Outgoing save contents are not logged. Error messages include a quoted preview of up to 512 response-body bytes, with a truncation marker when needed. Full error response bodies are additionally logged only when smaller than 4 KiB. Newlines and control characters are escaped, and valid UTF-8 characters are not split. A server response could echo sensitive data, so review logs before sharing them.
+
+### Proxy settings
+
+Set `proxy_url` in `config.json` and restart the app:
+
+- `""` (default): use environment proxy settings, otherwise connect directly. Uploads use HTTPS, so `HTTPS_PROXY` is the relevant proxy variable.
+- `"http://127.0.0.1:8080"`: HTTP proxy (HTTPS uploads use CONNECT tunneling).
+- `"https://proxy.example:8443"`: TLS connection to the proxy.
+- `"socks5://127.0.0.1:1080"` or `"socks5h://127.0.0.1:1080"`: SOCKS5 proxy with proxy-side destination resolution.
+- `"direct"`: connect directly unless an environment proxy is set for the request's scheme.
+
+Proxy selection is environment-first per request scheme: `HTTPS_PROXY` or `HTTP_PROXY`, then configured `proxy_url`, then direct. Lowercase environment names are also supported. `NO_PROXY` bypasses both environment and configured proxies; localhost and loopback addresses also bypass proxying, following Go's standard behavior. Environment settings are captured when the HTTP client is created.
+
+Optional credentials use `scheme://username:password@host:port`; percent-encode special characters. Credentials are stored as plaintext in `config.json`, so do not share it. Invalid proxy configuration stops startup instead of silently connecting directly. TLS certificate validation remains enabled.
+
+Windows system proxy settings and PAC scripts are not automatically imported. Restart after changing configuration or environment variables; changing sign-in startup behavior does not import a terminal's proxy environment into Windows Explorer.
 
 ## Supported save layout
 

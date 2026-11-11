@@ -25,8 +25,8 @@ func RunTray(ctx context.Context, cancel context.CancelFunc, commands chan<- app
 		lastItem := systray.AddMenuItem("Last upload: never", "")
 		lastItem.Disable()
 		systray.AddSeparator()
-		pause := systray.AddMenuItemCheckbox("Automatic uploads", "Toggle automatic uploads", config.Automatic)
-		upload := systray.AddMenuItem("Upload now", "Upload once, even when paused")
+		automaticUploads := systray.AddMenuItemCheckbox("Automatic uploads", "Send new saves automatically; queued uploads and retries continue when off", config.Automatic)
+		upload := systray.AddMenuItem("Upload now", "Upload current saves even with Automatic uploads off")
 		folder := systray.AddMenuItem("Choose save folder...", "")
 		startup := systray.AddMenuItemCheckbox("Launch at Windows sign-in", "", config.LaunchAtLogin)
 		board := systray.AddMenuItem("Open leaderboard", "")
@@ -66,9 +66,9 @@ func RunTray(ctx context.Context, cancel context.CancelFunc, commands chan<- app
 						lastItem.SetTitle("Last upload: " + update.LastUpload.Format("2006-01-02 15:04:05"))
 					}
 					if update.Config.Automatic {
-						pause.Check()
+						automaticUploads.Check()
 					} else {
-						pause.Uncheck()
+						automaticUploads.Uncheck()
 					}
 					if update.Config.LaunchAtLogin {
 						startup.Check()
@@ -78,7 +78,7 @@ func RunTray(ctx context.Context, cancel context.CancelFunc, commands chan<- app
 				case <-statusItem.ClickedCh:
 					text := latest.Message + "\n\nSave folder: " + latest.Config.SaveFolder
 					go Message("CWG2 Uploader status", text)
-				case <-pause.ClickedCh:
+				case <-automaticUploads.ClickedCh:
 					send(app.Command{Kind: "pause"})
 				case <-upload.ClickedCh:
 					send(app.Command{Kind: "upload"})

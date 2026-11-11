@@ -117,6 +117,10 @@ Distribute the tray executable; players do not need Go installed. Builds are cur
 
 To uninstall, first disable **Launch at Windows sign-in**, quit, and delete the executable. Optionally delete `%LOCALAPPDATA%\CWG2Uploader\`. Removing local data does not remove submissions already held by the leaderboard service.
 
+## License
+
+[MIT](LICENSE). Third-party dependencies retain their respective licenses; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Include both files with distributions.
+
 ## Development documentation
 
 - [DESIGN.md](DESIGN.md): behavior and architecture decisions.

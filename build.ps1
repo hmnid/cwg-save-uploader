@@ -11,7 +11,7 @@ try {
     go build -trimpath '-ldflags=-s -w' -o dist/cwg2-uploader-console.exe .
     if ($LASTEXITCODE -ne 0) { throw 'Console build failed' }
     & (Join-Path $PSScriptRoot 'scripts\notices.ps1')
-    Copy-Item README.md, THIRD_PARTY_NOTICES.md -Destination dist
+    Copy-Item README.md, LICENSE, THIRD_PARTY_NOTICES.md -Destination dist
     Write-Host 'Built dist/cwg2-uploader.exe and dist/cwg2-uploader-console.exe'
 } finally {
     Pop-Location

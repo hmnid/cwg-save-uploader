@@ -88,8 +88,10 @@ Requires Windows, Go 1.24 or newer, and Windows PowerShell for the built-in fold
 
 This deletes the previous `dist` directory, runs tests and `go vet`, then produces:
 
-- `dist\cwg2-uploader.exe`: tray application, no console window.
-- `dist\cwg2-uploader-console.exe`: console-enabled build for diagnostics.
+- `dist\cwg2-uploader.exe`: starts in tray mode, without a console window.
+- `dist\cwg2-uploader-console.exe`: starts in console mode, without the tray, and prints logs to the terminal. No mode flag is needed.
+
+Both binaries share the same application code. Windows records the GUI/console subsystem in the executable: the GUI build avoids an unwanted console window, while the console build works naturally with terminal output, redirection, and shell waiting. Keeping them separate avoids console attachment/allocation code and GUI-process shell quirks. The console build uses the `console` Go build tag; the regular build does not.
 
 It also includes README and license notices. Failed builds remove partial `dist` output; keep anything you want to preserve elsewhere. `scripts\notices.ps1` is an internal helper called by `build.ps1`, not a standalone command.
 
@@ -99,6 +101,7 @@ Or run commands individually:
 go test ./...
 go vet ./...
 go build -trimpath -ldflags="-H=windowsgui -s -w" -o dist/cwg2-uploader.exe .
+go build -tags=console -trimpath -ldflags="-s -w" -o dist/cwg2-uploader-console.exe .
 ```
 
 Inspect one stable snapshot without submitting anything:
@@ -107,7 +110,9 @@ Inspect one stable snapshot without submitting anything:
 .\dist\cwg2-uploader-console.exe --dry-run
 ```
 
-Dry run prints the eligible file count and exits after reading a valid stable snapshot. It does not upload or write successful-upload state; it still creates default configuration and logs if absent. If saves are missing, it keeps waiting; press Ctrl+C to stop. `--console` runs the normal automatic-upload workflow without the tray. Do not use that flag when you only want a dry run.
+Dry run prints the eligible file count and exits after reading a valid stable snapshot. It does not upload or write successful-upload state; it still creates default configuration and logs if absent. If saves are missing, it keeps waiting; press Ctrl+C to stop. Use the console binary for command-line output; the GUI binary also accepts `--dry-run`, but has no guaranteed terminal output.
+
+**Running the console executable without `--dry-run` starts real automatic uploading according to configuration.** It does not require `--console`; that option has been removed. Quit any running tray instance before starting the console executable.
 
 Automated tests use temporary save fixtures and local HTTP servers, not the real leaderboard. A live upload still needs compatibility verification with explicitly approved saves.
 

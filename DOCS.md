@@ -10,6 +10,8 @@ Use one Go module with a small number of packages:
 go.mod
 go.sum
 main.go                # Windows entry point
+mode_tray_windows.go   # Default tray mode (without console build tag)
+mode_console_windows.go # Default console mode (console build tag)
 build.ps1              # Test, vet, and build release executables
 README.md
 DESIGN.md
@@ -51,7 +53,7 @@ Tests live alongside implementations as `*_test.go`. Place sample saves in the r
 
 ## Responsibilities
 
-- **`main.go`:** wire dependencies and start the application; keep application logic elsewhere. Present the upload disclosure before starting the coordinator, recording `Config.UploadNoticeShown` only after a normal-run presentation and config save succeed. Dry runs leave it pending. Listen for both interrupt and Windows SIGTERM notifications, then cancel and drain the coordinator before closing resources; Windows close/logoff/shutdown cleanup remains subject to OS deadlines.
+- **`main.go`:** wire dependencies and start the application; keep application logic elsewhere. The `console` build tag selects console mode by default; without it the executable defaults to tray mode. `--dry-run` requests local inspection in either build; there is no `--console` flag. Present the upload disclosure before starting the coordinator, recording `Config.UploadNoticeShown` only after a normal-run presentation and config save succeed. Dry runs leave it pending. Listen for both interrupt and Windows SIGTERM notifications, then cancel and drain the coordinator before closing resources; Windows close/logoff/shutdown cleanup remains subject to OS deadlines.
 - **`app`:** own the synchronization workflow, lifecycle, and retry scheduling. Permit only one upload at a time.
 - **`saves`:** observe every eligible file's candidate contents, cache last-settled versions, require a settled version for every essential filename, prioritize essentials within bounded cache/snapshot budgets, and fingerprint the selected settled versions. All non-private `.pld` categories are eligible, including account verification. No HTTP or tray dependencies.
 - **`leaderboard`:** implement the upload protocol and classify errors. Do not read local files or retry indefinitely; scheduling belongs to `app`.

@@ -71,7 +71,7 @@ These observations come from the current frontend, not a documented stable API c
 
 ## User Experience
 
-Provide a Windows system-tray application for other players, with a console mode for development and troubleshooting.
+Provide a Windows system-tray application for other players, plus a separate console executable for development and troubleshooting. Both share application code: the normal build defaults to tray mode and uses the Windows GUI subsystem; the `console` Go build tag selects console mode and the console subsystem. No `--console` flag is needed. Separate binaries avoid console attachment/allocation machinery and give command-line users normal output, redirection, and shell waiting. The console binary uploads according to configuration unless `--dry-run` is supplied.
 
 Tray actions:
 

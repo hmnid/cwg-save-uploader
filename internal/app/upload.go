@@ -40,7 +40,6 @@ func (u *snapshotUploader) run(ctx context.Context, output chan<- uploadEvent, c
 		}
 		failed = nil
 		workLogger := prefixedLogger(logger, fmt.Sprintf("work_id=%d ", update.id))
-		workLogger.Printf("snapshot queued: %d eligible files", len(update.snapshot.Files))
 		if dryRun {
 			workLogger.Printf("dry-run snapshot prepared: %d eligible files", len(update.snapshot.Files))
 			output <- uploadPreviewed{id: update.id, saveFolder: update.saveFolder, fileCount: len(update.snapshot.Files)}

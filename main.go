@@ -20,11 +20,20 @@ import (
 )
 
 func main() {
-	console := flag.Bool("console", false, "run without the tray (automatic uploads are enabled by configuration)")
-	dryRun := flag.Bool("dry-run", false, "inspect one stable snapshot without uploading; implies console mode")
+	dryRun := flag.Bool("dry-run", false, "inspect one stable snapshot without uploading; use the console binary for terminal output")
+	flag.Usage = func() {
+		fmt.Fprintf(flag.CommandLine.Output(), "Usage: %s [--dry-run]\n", os.Args[0])
+		if consoleBuild {
+			fmt.Fprintln(flag.CommandLine.Output(), "Console build: normal runs upload according to configuration, without the tray.")
+		} else {
+			fmt.Fprintln(flag.CommandLine.Output(), "Tray build: normal runs use the Windows notification area.")
+		}
+		flag.PrintDefaults()
+	}
 	flag.Parse()
-	if err := run(*console || *dryRun, *dryRun); err != nil {
-		if *console || *dryRun {
+	console := consoleBuild || *dryRun
+	if err := run(console, *dryRun); err != nil {
+		if console {
 			fmt.Fprintln(os.Stderr, err)
 		} else {
 			ui.Message("CWG2 Uploader", err.Error())
